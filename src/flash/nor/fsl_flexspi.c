@@ -52,7 +52,8 @@
 
 #define TIMEOUT_EXEC_IPCMD			100
 #define TIMEOUT_RESET				100
-#define TIMEOUT_FLASH_ERASE			2000
+#define TIMEOUT_FLASH_ERASE_SECTOR	1000
+#define TIMEOUT_FLASH_ERASE_CHIP	90000
 #define TIMEOUT_FLASH_PROGRAM		250
 
 /* These are the base addresses used on the IMXRT1020 */
@@ -752,7 +753,7 @@ static int erase_sector(struct flash_bank *bank, unsigned int sector)
 	LOG_DEBUG("erasing sector %4u", sector);
 
 	/* Poll the flash device for end of internally timed Sector Erase operation */
-	ret = poll_flash_status(bank, 0, SPIFLASH_BSY_BIT, TIMEOUT_FLASH_ERASE);
+	ret = poll_flash_status(bank, 0, SPIFLASH_BSY_BIT, TIMEOUT_FLASH_ERASE_SECTOR);
 	if (ret != ERROR_OK)
 		goto err;
 
@@ -836,6 +837,94 @@ static int default_setup(struct flash_bank *bank)
 	ret = target_write_u32(target, io_base + REG_MCR0, (mcr0 & ~(MCR0_MDIS | MCR0_ARDFEN | MCR0_ATDFEN)));
 	if (ret != ERROR_OK)
 		goto err;
+
+	return ERROR_OK;
+
+err:
+	return ret;
+}
+
+COMMAND_HANDLER(fsl_flexspi_handle_mass_erase_command)
+{
+	struct target *target = NULL;
+	struct flash_bank *bank;
+	struct fsl_flexspi_flash_bank *flexspi_info;
+	unsigned int sector;
+	uint8_t status;
+	long long starttime;
+	int ret;
+
+	LOG_DEBUG("%s", __func__);
+
+	if (CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	ret = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+	if (ret != ERROR_OK)
+		goto err;
+
+	flexspi_info = bank->driver_priv;
+	target = bank->target;
+
+	if (target->state != TARGET_HALTED) {
+		LOG_ERROR("Target not halted");
+		ret = ERROR_TARGET_NOT_HALTED;
+		goto err;
+	}
+
+	if (!(flexspi_info->probed)) {
+		LOG_ERROR("Flash bank not probed");
+		ret = ERROR_FLASH_BANK_NOT_PROBED;
+		goto err;
+	}
+
+	if (flexspi_info->dev.chip_erase_cmd == 0x00) {
+		LOG_ERROR("Mass erase not available for this device");
+		ret = ERROR_FLASH_OPER_UNSUPPORTED;
+		goto err;
+	}
+
+	for (sector = 0; sector < bank->num_sectors; sector++) {
+		if (bank->sectors[sector].is_protected) {
+			LOG_ERROR("Flash sector %u protected", sector);
+			ret = ERROR_FLASH_PROTECTED;
+			goto err;
+		}
+	}
+
+	ret = write_enable(bank);
+	if (ret != ERROR_OK)
+		goto err;
+
+	starttime = timeval_ms();
+
+	ret = execute_ipcmd_read(bank, flexspi_info->dev.chip_erase_cmd, NULL, 0);
+	if (ret != ERROR_OK)
+		goto err;
+
+	/*
+	 * Check status register to see if the flash device appears to have
+	 * accepted the command and is now executing it.  If BSY and WE are clear,
+	 * we assume erase already completed.  If BSY is clear but WE is still set,
+	 * the command wasn't accepted.
+	 */
+	ret = read_status_reg(bank, &status);
+	if (ret != ERROR_OK)
+		goto err;
+
+	if (((status & SPIFLASH_BSY_BIT) == 0) && ((status & SPIFLASH_WE_BIT) != 0)) {
+		LOG_ERROR("Chip erase command not accepted by flash. status=0x%02x", status);
+		ret = ERROR_FLASH_OPERATION_FAILED;
+		goto err;
+	}
+
+	LOG_INFO("Waiting for chip erase to finish");
+
+	ret = poll_flash_status(bank, 0, SPIFLASH_BSY_BIT, TIMEOUT_FLASH_ERASE_CHIP);
+	if (ret != ERROR_OK)
+		goto err;
+
+	LOG_INFO("Chip erase completed in %lldms", timeval_ms() - starttime);
 
 	return ERROR_OK;
 
@@ -1212,8 +1301,31 @@ FLASH_BANK_COMMAND_HANDLER(fsl_flexspi_flash_bank_command)
 	return ERROR_OK;
 }
 
+static const struct command_registration fsl_flexspi_exec_command_handlers[] = {
+	{
+		.name = "mass_erase",
+		.handler = fsl_flexspi_handle_mass_erase_command,
+		.mode = COMMAND_EXEC,
+		.usage = "bank_id",
+		.help = "Mass erase entire flash device.",
+	},
+	COMMAND_REGISTRATION_DONE
+};
+
+static const struct command_registration fsl_flexspi_command_handlers[] = {
+	{
+		.name = "fsl_flexspi",
+		.mode = COMMAND_ANY,
+		.help = "fsl_flexspi flash command group",
+		.usage = "",
+		.chain = fsl_flexspi_exec_command_handlers,
+	},
+	COMMAND_REGISTRATION_DONE
+};
+
 const struct flash_driver fsl_flexspi_flash = {
 	.name = "fsl_flexspi",
+	.commands = fsl_flexspi_command_handlers,
 	.flash_bank_command = fsl_flexspi_flash_bank_command,
 	.erase = fsl_flexspi_erase,
 	.protect = fsl_flexspi_protect,
