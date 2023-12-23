@@ -253,10 +253,11 @@ static int lut_pad(int x)
 static int poll_reg(struct target *target, uint32_t value, uint32_t mask, uint32_t io_addr, unsigned int timeout)
 {
 	long long endtime;
+	uint32_t regval;
 
 	endtime = timeval_ms() + timeout;
+
 	do {
-		uint32_t regval;
 		int ret;
 
 		ret = target_read_u32(target, io_addr, &regval);
@@ -272,7 +273,9 @@ static int poll_reg(struct target *target, uint32_t value, uint32_t mask, uint32
 		alive_sleep(1);
 	} while (timeval_ms() < endtime);
 
-	LOG_ERROR("Timeout while polling register at %08x", io_addr);
+	LOG_ERROR("Timeout while polling register at %08" PRIx32 ": val=%08" PRIx32
+			", want=%08" PRIx32 "/%08" PRIx32, io_addr, regval, value, mask);
+
 	return ERROR_TIMEOUT_REACHED;
 }
 
@@ -474,6 +477,102 @@ static int execute_ipcmd_read(struct flash_bank *bank, uint8_t opcode,
 		ret = read_rxfifo(bank, buf, datalen);
 		if (ret != ERROR_OK)
 			goto err;
+	}
+
+	/* Clear status */
+	ret = target_write_u32(target, io_base + REG_INTR, INTR_IPCMDDONE | INTR_IPRXWA | INTR_IPTXWE);
+	if (ret != ERROR_OK)
+		goto err;
+
+	return ERROR_OK;
+
+err:
+	return ret;
+}
+
+static int execute_ipcmd_write(struct flash_bank *bank, uint8_t opcode,
+		const void *buf, uint32_t datalen)
+{
+	struct target *target = bank->target;
+	struct fsl_flexspi_flash_bank *flexspi_info = bank->driver_priv;
+	uint32_t io_base = flexspi_info->io_base;
+	uint32_t lutval[4] = {};
+	int lutidx = 0;
+	uint32_t intr, sts1;
+	int ret;
+
+	LOG_DEBUG("%s with opcode 0x%02x", __func__, opcode);
+
+	/* Prepare sequence LUT */
+	lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_CMD, lut_pad(1), opcode);
+	lutidx++;
+
+	if (datalen > 0) {
+		lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_WRITE, lut_pad(1), datalen);
+		lutidx++;
+	}
+
+	lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_STOP, 0, 0);
+	lutidx++;
+
+	ret = write_lut_memory(bank, lutval, LUTNUM_DRV);
+	if (ret != ERROR_OK)
+		goto err;
+
+	/* Reset FIFO states */
+	ret = target_write_u32(target, io_base + REG_IPRXFCR, IPRXFCR_CLRIPRXF);
+	if (ret != ERROR_OK)
+		goto err;
+
+	ret = target_write_u32(target, io_base + REG_IPTXFCR, IPTXFCR_CLRIPTXF);
+	if (ret != ERROR_OK)
+		goto err;
+
+	/* Clear any stray pending status */
+	ret = target_write_u32(target,
+						   io_base + REG_INTR,
+						   INTR_AHBCMDERR | INTR_IPCMDERR | INTR_AHBCMDGE | INTR_IPCMDGE);
+
+	/* Write data to FIFO */
+	if (datalen > 0) {
+		ret = fill_txfifo(bank, buf, datalen);
+		if (ret != ERROR_OK)
+			goto err;
+	}
+
+	/* Execute the command */
+	ret = target_write_u32(target, io_base + REG_IPCR0, IPCR0_SFAR(0));
+	if (ret != ERROR_OK)
+		goto err;
+
+	ret = target_write_u32(target,
+						   io_base + REG_IPCR1,
+						   IPCR1_IDATASZ(datalen) | IPCR1_ISEQID(LUTNUM_DRV) | IPCR1_ISEQNUM(0));
+	if (ret != ERROR_OK)
+		goto err;
+
+	ret = target_write_u32(target, io_base + REG_IPCMD, IPCMD_TRG);
+	if (ret != ERROR_OK)
+		goto err;
+
+	/* Wait for completion */
+	ret = poll_reg(target, INTR_IPCMDDONE, INTR_IPCMDDONE, io_base + REG_INTR, TIMEOUT_EXEC_IPCMD);
+	if (ret != ERROR_OK)
+		goto err;
+
+	/* Check for error */
+	ret = target_read_u32(target, io_base + REG_INTR, &intr);
+	if (ret != ERROR_OK)
+		goto err;
+
+	if (intr & INTR_IPCMDERR) {
+		ret = target_read_u32(target, io_base + REG_STS1, &sts1);
+		if (ret != ERROR_OK)
+			goto err;
+
+		LOG_ERROR("Error executing IP command. sts1=%08" PRIx32, sts1);
+		ret = ERROR_FLASH_OPERATION_FAILED;
+		goto err;
 	}
 
 	/* Clear status */
@@ -932,6 +1031,123 @@ err:
 	return ret;
 }
 
+COMMAND_HANDLER(fsl_flexspi_handle_exec_flashcmd_write_command)
+{
+	struct target *target = NULL;
+	struct flash_bank *bank;
+	struct fsl_flexspi_flash_bank *flexspi_info;
+	int ret;
+	uint8_t flashcmd;
+	uint8_t wrdata[32];
+	int nwrdata = CMD_ARGC - 2;
+
+	LOG_DEBUG("%s", __func__);
+
+	if (CMD_ARGC < 1 + 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (CMD_ARGC > 1 + 1 + 32) {
+		LOG_ERROR("Too much data");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	ret = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+	if (ret != ERROR_OK)
+		goto err;
+
+	flexspi_info = bank->driver_priv;
+	target = bank->target;
+
+	if (target->state != TARGET_HALTED) {
+		LOG_ERROR("Target not halted");
+		ret = ERROR_TARGET_NOT_HALTED;
+		goto err;
+	}
+
+	if (!(flexspi_info->probed)) {
+		LOG_ERROR("Flash bank not probed");
+		ret = ERROR_FLASH_BANK_NOT_PROBED;
+		goto err;
+	}
+
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[1], flashcmd);
+
+	for (int i = 0; i < nwrdata; i++)
+		COMMAND_PARSE_NUMBER(u8, CMD_ARGV[i + 2], wrdata[i]);
+
+	ret = execute_ipcmd_write(bank, flashcmd, wrdata, nwrdata);
+	if (ret != ERROR_OK)
+		goto err;
+
+	return ERROR_OK;
+
+err:
+	return ret;
+}
+
+COMMAND_HANDLER(fsl_flexspi_handle_exec_flashcmd_read_command)
+{
+	struct target *target = NULL;
+	struct flash_bank *bank;
+	struct fsl_flexspi_flash_bank *flexspi_info;
+	int ret;
+	uint8_t flashcmd;
+	uint32_t nrddata;
+	uint8_t *rddata;
+
+	LOG_DEBUG("%s", __func__);
+
+	if (CMD_ARGC != 3)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	ret = CALL_COMMAND_HANDLER(flash_command_get_bank, 0, &bank);
+	if (ret != ERROR_OK)
+		goto err;
+
+	flexspi_info = bank->driver_priv;
+	target = bank->target;
+
+	if (target->state != TARGET_HALTED) {
+		LOG_ERROR("Target not halted");
+		ret = ERROR_TARGET_NOT_HALTED;
+		goto err;
+	}
+
+	if (!(flexspi_info->probed)) {
+		LOG_ERROR("Flash bank not probed");
+		ret = ERROR_FLASH_BANK_NOT_PROBED;
+		goto err;
+	}
+
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[1], flashcmd);
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[2], nrddata);
+
+	rddata = calloc(1, nrddata);
+
+	if (!rddata) {
+		LOG_ERROR("not enough memory");
+		ret = ERROR_FAIL;
+		goto err;
+	}
+
+	ret = execute_ipcmd_read(bank, flashcmd, rddata, nrddata);
+	if (ret != ERROR_OK)
+		goto err_dealloc;
+
+	command_print(CMD, "Read data (hex):");
+	for (uint32_t i = 0; i < nrddata; i++)
+		command_print_sameline(CMD, " %02x", rddata[i]);
+
+	free(rddata);
+
+	return ERROR_OK;
+
+err_dealloc:
+	free(rddata);
+err:
+	return ret;
+}
+
 static int fsl_flexspi_erase(struct flash_bank *bank, unsigned int first,
 		unsigned int last)
 {
@@ -1143,6 +1359,12 @@ static int fsl_flexspi_probe(struct flash_bank *bank)
 		}
 	}
 
+	if (!flexspi_info->dev.name) {
+		/* Chip could not be identified by ID */
+		LOG_WARNING("Unknown flash A1 device id = 0x%06" PRIx32, id);
+		goto err;
+	}
+
 	/* Configure flash size */
 	bank->size = flexspi_info->dev.size_in_bytes;
 
@@ -1308,6 +1530,20 @@ static const struct command_registration fsl_flexspi_exec_command_handlers[] = {
 		.mode = COMMAND_EXEC,
 		.usage = "bank_id",
 		.help = "Mass erase entire flash device.",
+	},
+	{
+		.name = "exec_flashcmd_write",
+		.handler = fsl_flexspi_handle_exec_flashcmd_write_command,
+		.mode = COMMAND_EXEC,
+		.usage = "bank_id cmdbyte [databytes...]",
+		.help = "Execute an arbitrary flash command with written optional arguments",
+	},
+	{
+		.name = "exec_flashcmd_read",
+		.handler = fsl_flexspi_handle_exec_flashcmd_read_command,
+		.mode = COMMAND_EXEC,
+		.usage = "bank_id cmdbyte numbytes",
+		.help = "Execute an arbitrary flash command with subsequent data read",
 	},
 	COMMAND_REGISTRATION_DONE
 };
