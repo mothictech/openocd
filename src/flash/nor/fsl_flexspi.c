@@ -44,177 +44,21 @@
 #endif
 
 #include "imp.h"
-#include "spi.h"
 
 #include <helper/align.h>
+#include <helper/binarybuffer.h>
 #include <helper/bits.h>
 #include <helper/time_support.h>
+#include <target/algorithm.h>
+#include <target/armv7m.h>
+
+#include "fsl_flexspi.h"
 
 #define TIMEOUT_EXEC_IPCMD			100
 #define TIMEOUT_RESET				100
 #define TIMEOUT_FLASH_ERASE_SECTOR	1000
 #define TIMEOUT_FLASH_ERASE_CHIP	90000
 #define TIMEOUT_FLASH_PROGRAM		250
-
-/* These are the base addresses used on the IMXRT1020 */
-#define FLEXSPI_DEFAULT_IOBASE		0x402A8000
-#define FLEXSPI_LINEAR_AHBASE		0x60000000
-#define FLEXSPI_TX_FIFO_AHBASE		0x7F800000
-#define FLEXSPI_RX_FIFO_AHBASE		0x7FC00000
-
-/* The documentation implies that these may be chip-specific tweakables */
-#define FLEXSPI_AHB_TX_BUFSZ		64
-#define FLEXSPI_AHB_RX_BUFSZ		1024
-#define FLEXSPI_IP_TX_FIFOSZ		128
-#define FLEXSPI_IP_RX_FIFOSZ		128
-
-/* On-chip registers and fields */
-#define REG_MCR0					0x00
-#define MCR0_SWRESET				BIT(0)
-#define MCR0_MDIS					BIT(1)
-#define MCR0_ARDFEN					BIT(6)
-#define MCR0_ATDFEN					BIT(7)
-
-#define REG_AHBCR					0x0C
-#define AHBCR_ALIGNMENT(x)			(((x) & 0x03) << 20)
-#define AHBCR_READSZALIGN			BIT(10)
-#define AHBCR_READADDROPT			BIT(6)
-#define AHBCR_PREFETCHEN			BIT(5)
-#define AHBCR_BUFFERABLEEN			BIT(4)
-#define AHBCR_CACHABLEEN			BIT(3)
-#define AHBCR_APAREN				BIT(0)
-
-#define REG_INTR					0x14
-#define INTR_IPCMDDONE				BIT(0)
-#define INTR_IPCMDGE				BIT(1)
-#define INTR_AHBCMDGE				BIT(2)
-#define INTR_IPCMDERR				BIT(3)
-#define INTR_AHBCMDERR				BIT(4)
-#define INTR_IPRXWA					BIT(5)
-#define INTR_IPTXWE					BIT(6)
-#define INTR_SCKSTOPBYRD			BIT(8)
-#define INTR_SCKSTOPBYWR			BIT(9)
-#define INTR_AHBBUSTTIMEOUT			BIT(10)
-#define INTR_SEQTIMEOUT				BIT(11)
-#define INTR_IPCMDSECUREVIO			BIT(16)
-
-#define REG_LUTKEY					0x18
-#define LUTKEY_MAGIC				0x5AF05AF0
-
-#define REG_LUTCR					0x1C
-#define LUTCR_LOCK					BIT(0)
-#define LUTCR_UNLOCK				BIT(1)
-#define LUTCR_PROTECT				BIT(2)
-
-#define REG_AHBRXBUF0CR0			0x20
-#define REG_AHBRXBUF1CR0			0x24
-#define REG_AHBRXBUF2CR0			0x28
-#define REG_AHBRXBUF3CR0			0x2C
-#define AHBRXBUFNCR0_BUFSZ(x)		(((x) & 0xFF) << 0)
-#define AHBRXBUFNCR0_MSTRID(x)		(((x) & 0x0F) << 16)
-#define AHBRXBUFNCR0_PRIORITY(x)	(((x) & 0x03) << 24)
-#define AHBRXBUFNCR0_REGIONEN		BIT(30)
-#define AHBRXBUFNCR0_PREFETCHEN		BIT(31)
-
-#define REG_FLSHA1CR0				0x60
-#define FLSHNNCR0_FLASHSZ(x)		(((x) & 0x7FFFFF) << 0)
-
-#define REG_FLSHA1CR1				0x70
-#define FLSHNNCR1_TCSS(x)			(((x) & 0x1F) << 0)
-#define FLSHNNCR1_TCSH(x)			(((x) & 0x1F) << 5)
-#define FLSHNNCR1_WA				BIT(10)
-#define FLSHNNCR1_CAS(x)			(((x) & 0x0F) << 11)
-#define FLSHNNCR1_CSINTERVALUNIT	BIT(15)
-#define FLSHNNCR1_CSINTERVAL(x)		(((x) & 0xFFFF) << 16)
-
-#define REG_FLSHA1CR2				0x80
-#define FLSHNNCR2_ARDSEQID(x)		(((x) & 0x0F) << 0)
-#define FLSHNNCR2_ARDSEQNUM(x)		(((x) & 0x07) << 5)
-#define FLSHNNCR2_AWRSEQID(x)		(((x) & 0x0F) << 8)
-#define FLSHNNCR2_AWRSEQNUM(x)		(((x) & 0x07) << 13)
-#define FLSHNNCR2_AWRWAIT(x)		(((x) & 0x0FFF) << 16)
-#define FLSHNNCR2_AWRWAITUNIT(x)	(((x) & 0x07) << 28)
-#define AWRWAITUNIT_2AHB			0
-#define AWRWAITUNIT_8AHB			1
-#define AWRWAITUNIT_32AHB			2
-#define AWRWAITUNIT_128AHB			3
-#define AWRWAITUNIT_512AHB			4
-#define AWRWAITUNIT_2048AHB			5
-#define AWRWAITUNIT_8192AHB			6
-#define AWRWAITUNIT_32768AHB		7
-#define FLSHNNCR2_CLRINSTRPTR		BIT(31)
-
-#define REG_FLSHCR4					0x94
-#define FLSHCR4_WMOPT1				BIT(0)
-#define FLSHCR4_WMENA				BIT(2)
-#define FLSHCR4_WMENB				BIT(3)
-#define FLSHCR4_PAR_WM(x)			(((x) & 0x03) << 9)
-#define FLSHCR4_PAR_ADDR_ADJ_DIS	BIT(11)
-
-#define REG_IPCR0					0xA0
-#define IPCR0_SFAR(x)				(x)
-
-#define REG_IPCR1					0xA4
-#define IPCR1_IDATASZ(x)			(((x) & 0xFFFF) << 0)
-#define IPCR1_ISEQID(x)				(((x) & 0x0F) << 16)
-#define IPCR1_ISEQNUM(x)			(((x) & 0x0F) << 24)
-#define IPCR1_IPAREN				BIT(31)
-
-#define REG_IPCMD					0xB0
-#define IPCMD_TRG					BIT(0)
-
-#define REG_IPRXFCR					0xB8
-#define IPRXFCR_CLRIPRXF			BIT(0)
-#define IPRXFCR_RXDMAEN				BIT(1)
-#define IPRXFCR_RXWMRK(x)			(((x) & 0x0F) << 2)
-
-#define REG_IPTXFCR					0xBC
-#define IPTXFCR_CLRIPTXF			BIT(0)
-#define IPTXFCR_TXDMAEN				BIT(1)
-#define IPTXFCR_TXWMRK(x)			(((x) & 0x0F) << 2)
-
-#define REG_STS1					0xE4
-
-#define REG_RFDR					0x100
-#define REG_TFDR					0x180
-
-#define REG_LUT_BASE				0x200
-#define REG_LUT(x)					(REG_LUT_BASE + (x) * 4)
-
-/*
- * This LUT sequence number is used only during probe to read flash IDs
- *
- * The LUT sequence number 0 is the default for FlexSPI NOR (and NAND?) boot
- */
-#define LUTNUM_AHB_READ				0
-
-/*
- * The (only) LUT sequence number to be used by the driver after probing
- *
- * Other LUT sequence numbers will not be touched and can be used by
- * application code without impeding operating by the driver without controller
- * re-initialization if some other basic conditions are met.
- *
- * The LUT sequence number 10 is not used by boot procedures nor the Freescale
- * sample code
- */
-#define LUTNUM_DRV					10
-
-/* Instruction set for the LUT register (SDR only) */
-#define OPCODE_STOP					0
-#define OPCODE_CMD					1
-#define OPCODE_RADDR				2
-#define OPCODE_CADDR				3
-#define OPCODE_MODE1				4
-#define OPCODE_MODE2				5
-#define OPCODE_MODE4				6
-#define OPCODE_MODE8				7
-#define OPCODE_WRITE				8
-#define OPCODE_READ					9
-#define OPCODE_LEARN				10
-#define OPCODE_DATSZ				11
-#define OPCODE_DUMMY				12
-#define OPCODE_JMP_ON_CS			31
 
 /*
  * Macro for constructing the LUT entries with the following
@@ -288,6 +132,8 @@ static int read_rxfifo(struct flash_bank *bank, uint8_t *buf, uint32_t datalen)
 	int ret;
 	uint32_t nbytes;
 	uint8_t bytes[4];
+
+	LOG_DEBUG("want %" PRIx32 "B", datalen);
 
 	ret = target_write_u32(target, io_base + REG_IPRXFCR, IPRXFCR_RXWMRK(datalen / 8 - 1));
 	if (ret != ERROR_OK)
@@ -394,8 +240,8 @@ err:
 	return ret;
 }
 
-static int execute_ipcmd_read(struct flash_bank *bank, uint8_t opcode,
-		void *buf, uint32_t datalen)
+static int execute_ipcmd_read_with_lutnum(struct flash_bank *bank, uint8_t opcode,
+		void *buf, uint32_t datalen, uint32_t lutnum)
 {
 	struct target *target = bank->target;
 	struct fsl_flexspi_flash_bank *flexspi_info = bank->driver_priv;
@@ -419,7 +265,7 @@ static int execute_ipcmd_read(struct flash_bank *bank, uint8_t opcode,
 	lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_STOP, 0, 0);
 	lutidx++;
 
-	ret = write_lut_memory(bank, lutval, LUTNUM_DRV);
+	ret = write_lut_memory(bank, lutval, lutnum);
 	if (ret != ERROR_OK)
 		goto err;
 
@@ -444,7 +290,7 @@ static int execute_ipcmd_read(struct flash_bank *bank, uint8_t opcode,
 
 	ret = target_write_u32(target,
 						   io_base + REG_IPCR1,
-						   IPCR1_IDATASZ(datalen) | IPCR1_ISEQID(LUTNUM_DRV) | IPCR1_ISEQNUM(0));
+						   IPCR1_IDATASZ(datalen) | IPCR1_ISEQID(lutnum) | IPCR1_ISEQNUM(0));
 	if (ret != ERROR_OK)
 		goto err;
 
@@ -488,6 +334,13 @@ static int execute_ipcmd_read(struct flash_bank *bank, uint8_t opcode,
 
 err:
 	return ret;
+}
+
+static int execute_ipcmd_read(struct flash_bank *bank, uint8_t opcode,
+		void *buf, uint32_t datalen)
+{
+	return execute_ipcmd_read_with_lutnum(
+			bank, opcode, buf, datalen, LUTNUM_DRV);
 }
 
 static int execute_ipcmd_write(struct flash_bank *bank, uint8_t opcode,
@@ -612,7 +465,7 @@ static int read_status_reg(struct flash_bank *bank, uint8_t *statusreg)
 
 	*statusreg = 0;
 
-	ret = execute_ipcmd_read(bank, SPIFLASH_READ_STATUS, statusreg, sizeof(*statusreg));
+	ret = execute_ipcmd_read_with_lutnum(bank, SPIFLASH_READ_STATUS, statusreg, sizeof(*statusreg), LUTNUM_READ_STATUS);
 	if (ret != ERROR_OK)
 		goto err;
 
@@ -628,7 +481,7 @@ static int write_enable(struct flash_bank *bank)
 
 	LOG_DEBUG("reached");
 
-	ret = execute_ipcmd_read(bank, SPIFLASH_WRITE_ENABLE, NULL, 0);
+	ret = execute_ipcmd_read_with_lutnum(bank, SPIFLASH_WRITE_ENABLE, NULL, 0, LUTNUM_WRITE_ENABLE);
 	if (ret != ERROR_OK)
 		goto err;
 
@@ -663,22 +516,13 @@ static int poll_flash_status(struct flash_bank *bank, uint8_t value, uint8_t mas
 	return ERROR_TIMEOUT_REACHED;
 }
 
-static int execute_page_program(struct flash_bank *bank, uint8_t opcode,
-		const void *buf, uint32_t flashaddr, uint32_t datalen)
+static int setup_write_lut(struct flash_bank *bank, uint8_t opcode,
+		uint32_t writelen)
 {
-	struct target *target = bank->target;
-	struct fsl_flexspi_flash_bank *flexspi_info = bank->driver_priv;
-	uint32_t io_base = flexspi_info->io_base;
+	LOG_DEBUG("opcode: %02x, writelen: %u", opcode, writelen);
+
 	uint32_t lutval[4] = {};
 	int lutidx = 0;
-	uint8_t status;
-	int ret;
-
-	LOG_DEBUG("%" PRIu32 "B to 0x%08" PRIx32, datalen, flashaddr);
-
-	ret = write_enable(bank);
-	if (ret != ERROR_OK)
-		goto err;
 
 	/* Prepare sequence LUT */
 	lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_CMD, lut_pad(1), opcode);
@@ -695,17 +539,35 @@ static int execute_page_program(struct flash_bank *bank, uint8_t opcode,
 	lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_RADDR, lut_pad(1), naddrbytes * 8);
 	lutidx++;
 
-	if (datalen > 0) {
-		lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_WRITE, lut_pad(1), datalen);
+	if (writelen > 0) {
+		lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_WRITE, lut_pad(1), writelen);
 		lutidx++;
 	}
 
 	lutval[lutidx / 2] |= LUT_DEF(lutidx, OPCODE_STOP, 0, 0);
 	lutidx++;
 
-	ret = write_lut_memory(bank, lutval, LUTNUM_DRV);
+	return write_lut_memory(bank, lutval, LUTNUM_DRV);
+}
+
+static int program_page(struct flash_bank *bank, uint8_t opcode,
+		const void *buf, uint32_t flashaddr, uint32_t datalen)
+{
+	struct target *target = bank->target;
+	struct fsl_flexspi_flash_bank *flexspi_info = bank->driver_priv;
+	uint32_t io_base = flexspi_info->io_base;
+	uint8_t status;
+	int ret;
+
+	LOG_DEBUG("%" PRIu32 "B to 0x%08" PRIx32, datalen, flashaddr);
+
+	ret = write_enable(bank);
 	if (ret != ERROR_OK)
 		goto err;
+
+	ret = setup_write_lut(bank, opcode, datalen);
+	if(ret != ERROR_OK)
+		return ret;
 
 	/* Clear any stray pending status */
 	ret = target_write_u32(target,
@@ -773,6 +635,122 @@ err:
 	return ret;
 }
 
+/* Kinetis Program-LongWord Microcodes */
+static const uint8_t flexspi_flash_blockwrite_algo[] = {
+#include "../../../contrib/loaders/flash/fsl_flexspi_blockwrite.inc"
+};
+
+static int program_block(struct flash_bank *bank, uint8_t opcode,
+		const void *buf, uint32_t flashaddr, uint32_t datalen, uint32_t blksize)
+{
+	struct target *target = bank->target;
+	struct fsl_flexspi_flash_bank *flexspi_info = bank->driver_priv;
+	uint32_t progdata_size;
+	struct working_area *algo;
+	struct working_area *progdata;
+	struct reg_param reg_params[6];
+	struct armv7m_algorithm armv7m_info;
+	uint32_t end_address;
+	uint32_t blkcount;
+	int ret;
+	uint8_t statusreg;
+
+	/* Set up driver LUT for block write */
+	ret = setup_write_lut(bank, opcode, blksize);
+	if(ret != ERROR_OK)
+		return ret;
+
+	/* Run an extra read status command to ensure LUTNUM_READ_STATUS is set up */
+	ret = read_status_reg(bank, &statusreg);
+	if (ret != ERROR_OK)
+		return ret;
+
+	/* Likewise for write enable */
+	ret = write_enable(bank);
+	if (ret != ERROR_OK)
+		return ret;
+
+	/* allocate working area with flash programming code */
+	if (target_alloc_working_area(target, sizeof(flexspi_flash_blockwrite_algo),
+			&algo) != ERROR_OK) {
+		LOG_WARNING("no working area available, can't do block memory writes");
+		ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		goto out_noalgo;
+	}
+
+	ret = target_write_buffer(target, algo->address,
+		sizeof(flexspi_flash_blockwrite_algo), flexspi_flash_blockwrite_algo);
+	if (ret != ERROR_OK)
+		goto out_noprogdata;
+
+	/* memory buffer, size must be (multiple of blksize) plus 8 */
+	progdata_size = target_get_working_area_avail(target) & ~(sizeof(uint32_t) - 1);
+	if (progdata_size < (blksize * 2 + 8)) {
+		LOG_WARNING("large enough working area not available for block writes");
+		ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		goto out_noprogdata;
+	}
+
+	/* Anything bigger than 32k seems superfluous */
+	progdata_size = MIN(progdata_size, 32768 + 8);
+
+	/* Ensure it's a multiple of the blksize plus the extra 8 bytes for the rp/wp */
+	progdata_size = ALIGN_DOWN(progdata_size, blksize) + 8;
+
+	if (target_alloc_working_area(target, progdata_size, &progdata) != ERROR_OK) {
+		LOG_ERROR("allocating working area failed");
+		ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		goto out_noprogdata;
+	}
+
+	blkcount = datalen / blksize;
+
+	armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+	armv7m_info.core_mode = ARM_MODE_THREAD;
+
+	init_reg_param(&reg_params[0], "r0", 32, PARAM_IN_OUT);		/* flash address */
+	init_reg_param(&reg_params[1], "r1", 32, PARAM_OUT);		/* block count */
+	init_reg_param(&reg_params[2], "r2", 32, PARAM_OUT);		/* block length */
+	init_reg_param(&reg_params[3], "r3", 32, PARAM_OUT);		/* progdata start */
+	init_reg_param(&reg_params[4], "r4", 32, PARAM_OUT);		/* progdata end */
+	init_reg_param(&reg_params[5], "r5", 32, PARAM_OUT);		/* FLEXSPI base */
+
+	buf_set_u32(reg_params[0].value, 0, 32, flashaddr);
+	buf_set_u32(reg_params[1].value, 0, 32, blkcount);
+	buf_set_u32(reg_params[2].value, 0, 32, blksize / sizeof(uint32_t));
+	buf_set_u32(reg_params[3].value, 0, 32, progdata->address);
+	buf_set_u32(reg_params[4].value, 0, 32,
+			progdata->address + progdata->size);
+	buf_set_u32(reg_params[5].value, 0, 32, flexspi_info->io_base);
+
+	ret = target_run_flash_async_algorithm(target, buf, blkcount, blksize,
+						0, NULL, ARRAY_SIZE(reg_params), reg_params,
+						progdata->address, progdata->size,
+						algo->address, 0, &armv7m_info);
+
+	if (ret == ERROR_FLASH_OPERATION_FAILED) {
+		end_address = buf_get_u32(reg_params[0].value, 0, 32);
+
+		LOG_ERROR("Error writing flash at %08" PRIx32, end_address);
+	} else if (ret != ERROR_OK) {
+		LOG_ERROR("Error executing flash block programming algorithm");
+	}
+
+	destroy_reg_param(&reg_params[0]);
+	destroy_reg_param(&reg_params[1]);
+	destroy_reg_param(&reg_params[2]);
+	destroy_reg_param(&reg_params[3]);
+	destroy_reg_param(&reg_params[4]);
+
+	target_free_working_area(target, progdata);
+out_noprogdata:
+	target_free_working_area(target, algo);
+out_noalgo:
+
+	return ret;
+}
+
+
 static int erase_sector(struct flash_bank *bank, unsigned int sector)
 {
 	struct target *target = bank->target;
@@ -784,7 +762,7 @@ static int erase_sector(struct flash_bank *bank, unsigned int sector)
 	uint8_t status;
 	int ret;
 
-	LOG_DEBUG("reached");
+	LOG_DEBUG("number %u", sector);
 
 	ret = write_enable(bank);
 	if (ret != ERROR_OK)
@@ -1250,17 +1228,32 @@ static int fsl_flexspi_write(struct flash_bank *bank, const uint8_t *buffer,
 		}
 	}
 
+	/* Write the lesser of one page or the TX FIFO size at a time */
 	uint32_t wrsize = (flexspi_info->dev.pagesize < FLEXSPI_IP_TX_FIFOSZ) ?
 		flexspi_info->dev.pagesize :
 		FLEXSPI_IP_TX_FIFOSZ;
 
-		/* Write the lesser of one page or the TX FIFO size at a time */
+	/* Attempt to program the entire block using on-chip algorithm */
+	uint32_t blockwrlen = ALIGN_DOWN(count, wrsize);
+	LOG_DEBUG("Block program %" PRIu32 "B at 0x%08" PRIx32,blockwrlen, offset);
+	ret = program_block(bank, flexspi_info->dev.pprog_cmd, buffer, offset,
+			blockwrlen, wrsize);
+	if (ret == ERROR_OK) {
+		count -= blockwrlen;
+		offset += blockwrlen;
+		buffer += blockwrlen;
+	} else {
+		LOG_WARNING("Can't use block program; falling back to page program");
+		return ret;
+	}
+
+	/* Program by page whatever we couldn't program as a block */
 	while (count > 0) {
 		if (count < wrsize)
 			wrsize = count;
 
-		ret = execute_page_program(bank, flexspi_info->dev.pprog_cmd,
-				buffer, offset, wrsize);
+		ret = program_page(bank, flexspi_info->dev.pprog_cmd, buffer, offset,
+				wrsize);
 		if (ret != ERROR_OK)
 			goto err;
 
